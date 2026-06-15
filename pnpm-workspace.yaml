@@ -1,0 +1,5 @@
+# esbuild (a transitive dep of tsx) ships its prebuilt platform binary via an
+# optional dependency, so its postinstall build script is unnecessary. Decline
+# it explicitly so installs are clean and reproducible for contributors.
+allowBuilds:
+  esbuild: false
