@@ -79,6 +79,16 @@ src/shared/   byte-pipe primitive & address parsing shared by both
 tests/        cross-process integration test
 ```
 
+## Logging
+
+burrow logs operational events to stdout as NDJSON using [pino](https://getpino.io). Set the level with `LOG_LEVEL` (`debug` | `info` | `warn` | `error` | `silent`, default `info`):
+
+```bash
+LOG_LEVEL=debug pnpm dev:relay --public :8080 --control :4443
+```
+
+In an interactive terminal logs render human-readable via `pino-pretty`; when piped or redirected (CI, Docker, systemd) raw NDJSON is emitted for log processors. CLI usage errors (bad flags) are written to stderr as plain text.
+
 ## Roadmap
 
 - [x] **v0.1 — Single forwarding**: pair one public connection with one agent connection and pipe bytes as-is. One request per connection.

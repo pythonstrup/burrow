@@ -1,6 +1,8 @@
 import net, { type Socket } from "node:net";
-import { pipeSockets } from "../shared/index.js";
+import { logger, pipeSockets } from "../shared/index.js";
 import type { RelayConfig } from "./config.js";
+
+const log = logger("relay");
 
 export interface Relay {
   close(): void;
@@ -24,11 +26,16 @@ export function startRelay(config: RelayConfig): Relay {
       const agent = idleAgents.shift()!;
       const publicConn = waitingPublic.shift()!;
       pipeSockets(agent, publicConn);
+      log.debug(
+        { idleAgents: idleAgents.length, waitingPublic: waitingPublic.length },
+        "paired public connection with agent",
+      );
     }
   };
 
-  const enqueue = (queue: Socket[], socket: Socket): void => {
+  const enqueue = (queue: Socket[], socket: Socket, kind: string): void => {
     queue.push(socket);
+    log.debug({ kind, peer: socket.remoteAddress }, "connection accepted");
 
     const remove = (): void => {
       const index = queue.indexOf(socket);
@@ -41,18 +48,23 @@ export function startRelay(config: RelayConfig): Relay {
   };
 
   const controlServer = net.createServer((socket) =>
-    enqueue(idleAgents, socket),
+    enqueue(idleAgents, socket, "agent"),
   );
   const publicServer = net.createServer((socket) =>
-    enqueue(waitingPublic, socket),
+    enqueue(waitingPublic, socket, "public"),
   );
 
   controlServer.listen(config.controlPort, config.controlHost);
   publicServer.listen(config.publicPort, config.publicHost);
 
-  console.log(
-    `burrowd: relay up — public ${config.publicHost}:${config.publicPort}, ` +
-      `control ${config.controlHost}:${config.controlPort}`,
+  log.info(
+    {
+      publicHost: config.publicHost,
+      publicPort: config.publicPort,
+      controlHost: config.controlHost,
+      controlPort: config.controlPort,
+    },
+    "relay up",
   );
 
   return {
@@ -60,6 +72,7 @@ export function startRelay(config: RelayConfig): Relay {
       controlServer.close();
       publicServer.close();
       for (const socket of [...idleAgents, ...waitingPublic]) socket.destroy();
+      log.info("relay closed");
     },
   };
 }

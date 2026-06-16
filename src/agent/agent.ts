@@ -1,6 +1,8 @@
 import net, { type Socket } from "node:net";
-import { pipeSockets } from "../shared/index.js";
+import { logger, pipeSockets } from "../shared/index.js";
 import type { AgentConfig } from "./config.js";
+
+const log = logger("agent");
 
 export interface Agent {
   stop(): void;
@@ -41,8 +43,14 @@ export function startAgent(config: AgentConfig): Agent {
       connected += 1;
       if (connected === 2) {
         pipeSockets(relayConn, localConn);
-        console.log(
-          `burrow: tunnel ready — relay → ${config.localHost}:${config.localPort}`,
+        log.info(
+          {
+            relayHost: config.relayHost,
+            relayPort: config.relayPort,
+            localHost: config.localHost,
+            localPort: config.localPort,
+          },
+          "tunnel ready",
         );
       }
     };
@@ -51,14 +59,16 @@ export function startAgent(config: AgentConfig): Agent {
     localConn.once("connect", onConnect);
 
     relayConn.once("error", (err) => {
-      console.error(
-        `burrow: relay ${config.relayHost}:${config.relayPort} — ${err.message}`,
+      log.warn(
+        { relayHost: config.relayHost, relayPort: config.relayPort, err: err.message },
+        "relay connection failed, will retry",
       );
       retry();
     });
     localConn.once("error", (err) => {
-      console.error(
-        `burrow: local ${config.localHost}:${config.localPort} — ${err.message}`,
+      log.warn(
+        { localHost: config.localHost, localPort: config.localPort, err: err.message },
+        "local connection failed, will retry",
       );
       retry();
     });
