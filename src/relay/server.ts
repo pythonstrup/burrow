@@ -1,5 +1,5 @@
 import net, { type Socket } from "node:net";
-import { logger, pipeSockets } from "../shared/index.js";
+import { Session, logger } from "../shared/index.js";
 import type { RelayConfig } from "./config.js";
 
 const log = logger("relay");
@@ -9,50 +9,89 @@ export interface Relay {
 }
 
 /**
- * v0.1 single forwarding: park each agent (control) connection and each public
- * connection in a queue, pair them one-to-one, and pipe bytes as-is.
+ * v0.2 multiplexing: hold a single control connection to the agent and carry
+ * every public connection over it as a stream. The relay allocates a stream id
+ * per public connection, forwards its bytes as DATA frames, and demultiplexes
+ * frames coming back from the agent into the matching public sockets.
  *
- * A public socket with no data listener stays paused, so bytes that arrive
- * before an agent is available are buffered by Node rather than lost — they
- * flush the moment the pair is piped together. No multiplexing yet: one public
- * request rides one agent connection.
+ * Backpressure is connection-level: if the shared control socket backs up, the
+ * source public sockets pause and resume together on drain (no per-stream
+ * windows yet — that is a later step).
  */
 export function startRelay(config: RelayConfig): Relay {
-  const idleAgents: Socket[] = [];
-  const waitingPublic: Socket[] = [];
+  let agentSession: Session | null = null;
+  const streams = new Map<number, Socket>(); // streamId -> public socket
+  const pausedSources = new Set<Socket>();
 
-  const pairWaiting = (): void => {
-    while (idleAgents.length > 0 && waitingPublic.length > 0) {
-      const agent = idleAgents.shift()!;
-      const publicConn = waitingPublic.shift()!;
-      pipeSockets(agent, publicConn);
-      log.debug(
-        { idleAgents: idleAgents.length, waitingPublic: waitingPublic.length },
-        "paired public connection with agent",
-      );
+  const teardownStreams = (): void => {
+    for (const socket of streams.values()) socket.destroy();
+    streams.clear();
+    pausedSources.clear();
+  };
+
+  const controlServer = net.createServer((socket) => {
+    if (agentSession) {
+      agentSession.destroy(); // single-agent: newest connection wins
+      teardownStreams();
     }
-  };
 
-  const enqueue = (queue: Socket[], socket: Socket, kind: string): void => {
-    queue.push(socket);
-    log.debug({ kind, peer: socket.remoteAddress }, "connection accepted");
+    const session = new Session(socket, {
+      onData: (id, payload) => {
+        streams.get(id)?.write(payload);
+      },
+      onClose: (id) => {
+        const publicSocket = streams.get(id);
+        if (publicSocket) {
+          streams.delete(id);
+          publicSocket.destroy();
+        }
+      },
+      onSessionClose: () => {
+        if (agentSession === session) {
+          agentSession = null;
+          teardownStreams();
+          log.info("agent detached");
+        }
+      },
+    });
+    session.onDrain(() => {
+      for (const source of pausedSources) source.resume();
+      pausedSources.clear();
+    });
 
-    const remove = (): void => {
-      const index = queue.indexOf(socket);
-      if (index !== -1) queue.splice(index, 1);
+    agentSession = session;
+    log.info({ peer: socket.remoteAddress }, "agent attached");
+  });
+
+  const publicServer = net.createServer((publicSocket) => {
+    const session = agentSession;
+    if (!session) {
+      log.warn("public connection with no agent attached — dropping");
+      publicSocket.destroy();
+      return;
+    }
+
+    const id = session.openStream();
+    streams.set(id, publicSocket);
+    log.debug({ streamId: id, peer: publicSocket.remoteAddress }, "stream opened");
+
+    publicSocket.on("data", (chunk: Buffer) => {
+      if (!session.sendData(id, chunk)) {
+        publicSocket.pause();
+        pausedSources.add(publicSocket);
+      }
+    });
+
+    const end = (): void => {
+      pausedSources.delete(publicSocket);
+      if (streams.delete(id)) {
+        session.closeStream(id);
+        log.debug({ streamId: id }, "stream closed");
+      }
     };
-    socket.once("close", remove);
-    socket.once("error", remove);
-
-    pairWaiting();
-  };
-
-  const controlServer = net.createServer((socket) =>
-    enqueue(idleAgents, socket, "agent"),
-  );
-  const publicServer = net.createServer((socket) =>
-    enqueue(waitingPublic, socket, "public"),
-  );
+    publicSocket.once("close", end);
+    publicSocket.once("error", end);
+  });
 
   controlServer.listen(config.controlPort, config.controlHost);
   publicServer.listen(config.publicPort, config.publicHost);
@@ -71,7 +110,8 @@ export function startRelay(config: RelayConfig): Relay {
     close(): void {
       controlServer.close();
       publicServer.close();
-      for (const socket of [...idleAgents, ...waitingPublic]) socket.destroy();
+      agentSession?.destroy();
+      teardownStreams();
       log.info("relay closed");
     },
   };

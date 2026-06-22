@@ -1,5 +1,5 @@
 import net, { type Socket } from "node:net";
-import { logger, pipeSockets } from "../shared/index.js";
+import { Session, logger } from "../shared/index.js";
 import type { AgentConfig } from "./config.js";
 
 const log = logger("agent");
@@ -9,79 +9,116 @@ export interface Agent {
 }
 
 /**
- * v0.1 single forwarding: keep one outbound connection to the relay paired with
- * one connection to the local service. When the pair closes, open a fresh
- * tunnel so the next request is served. The connection is outbound-only, so the
- * agent works behind NAT/firewalls — the machine never opens an inbound port.
+ * v0.2 multiplexing: keep one persistent control connection to the relay and
+ * demultiplex its streams into per-stream connections to the local service.
+ * OPEN -> dial local, DATA -> forward, CLOSE -> tear down. The connection is
+ * outbound-only, so the agent works behind NAT/firewalls.
  */
 export function startAgent(config: AgentConfig): Agent {
   let stopped = false;
+  let session: Session | null = null;
+  const streams = new Map<number, Socket>(); // streamId -> local socket
+  const pending = new Map<number, Buffer[]>(); // DATA that arrived before local connected
+  const pausedSources = new Set<Socket>();
 
   const scheduleReconnect = (): void => {
-    if (stopped) return;
-    setTimeout(openTunnel, config.reconnectDelayMs);
+    if (!stopped) setTimeout(connect, config.reconnectDelayMs);
   };
 
-  const openTunnel = (): void => {
-    if (stopped) return;
+  const openLocal = (id: number): void => {
+    const local = net.connect(config.localPort, config.localHost);
+    streams.set(id, local);
 
-    const relayConn = net.connect(config.relayPort, config.relayHost);
-    const localConn = net.connect(config.localPort, config.localHost);
-
-    let connected = 0;
-    let retried = false;
-
-    const retry = (): void => {
-      if (retried) return;
-      retried = true;
-      relayConn.destroy();
-      localConn.destroy();
-      scheduleReconnect();
-    };
-
-    const onConnect = (): void => {
-      connected += 1;
-      if (connected === 2) {
-        pipeSockets(relayConn, localConn);
-        log.info(
-          {
-            relayHost: config.relayHost,
-            relayPort: config.relayPort,
-            localHost: config.localHost,
-            localPort: config.localPort,
-          },
-          "tunnel ready",
-        );
+    local.once("connect", () => {
+      const queued = pending.get(id);
+      if (queued) {
+        for (const chunk of queued) local.write(chunk);
+        pending.delete(id);
       }
+    });
+    local.on("data", (chunk: Buffer) => {
+      if (session && !session.sendData(id, chunk)) {
+        local.pause();
+        pausedSources.add(local);
+      }
+    });
+
+    const end = (): void => {
+      pausedSources.delete(local);
+      pending.delete(id);
+      if (streams.delete(id)) session?.closeStream(id);
     };
+    local.once("close", end);
+    local.once("error", end);
+  };
 
-    relayConn.once("connect", onConnect);
-    localConn.once("connect", onConnect);
+  function connect(): void {
+    if (stopped) return;
+    const socket = net.connect(config.relayPort, config.relayHost);
 
-    relayConn.once("error", (err) => {
+    socket.once("connect", () => {
+      log.info(
+        {
+          relayHost: config.relayHost,
+          relayPort: config.relayPort,
+          localHost: config.localHost,
+          localPort: config.localPort,
+        },
+        "connected to relay",
+      );
+    });
+    socket.once("error", (err) => {
       log.warn(
         { relayHost: config.relayHost, relayPort: config.relayPort, err: err.message },
-        "relay connection failed, will retry",
+        "control connection error, will retry",
       );
-      retry();
-    });
-    localConn.once("error", (err) => {
-      log.warn(
-        { localHost: config.localHost, localPort: config.localPort, err: err.message },
-        "local connection failed, will retry",
-      );
-      retry();
     });
 
-    relayConn.once("close", retry);
-    localConn.once("close", retry);
-  };
+    const current = new Session(socket, {
+      onOpen: (id) => openLocal(id),
+      onData: (id, payload) => {
+        const local = streams.get(id);
+        if (!local) return;
+        if (local.connecting) {
+          const queue = pending.get(id) ?? [];
+          queue.push(payload);
+          pending.set(id, queue);
+        } else {
+          local.write(payload);
+        }
+      },
+      onClose: (id) => {
+        const local = streams.get(id);
+        if (local) {
+          streams.delete(id);
+          pending.delete(id);
+          local.destroy();
+        }
+      },
+      onSessionClose: () => {
+        if (session !== current) return; // guard against error+close double-fire
+        session = null;
+        for (const local of streams.values()) local.destroy();
+        streams.clear();
+        pending.clear();
+        pausedSources.clear();
+        scheduleReconnect();
+      },
+    });
+    current.onDrain(() => {
+      for (const source of pausedSources) source.resume();
+      pausedSources.clear();
+    });
 
-  openTunnel();
+    session = current;
+  }
+
+  connect();
 
   return {
     stop(): void {
       stopped = true;
+      session?.destroy();
     },
   };
 }
