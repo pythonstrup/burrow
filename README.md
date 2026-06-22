@@ -22,17 +22,22 @@ Your machine never opens an inbound port. The agent establishes an outbound conn
 
 ## How it works
 
-burrow is built on Node's `net` module and stream pipes. Forwarding is just two
-sockets wired together:
+A single persistent **control connection** runs from the agent to the relay. Every
+public connection becomes a logical **stream** multiplexed over it:
 
-```js
-agentSocket.pipe(publicSocket);
-publicSocket.pipe(agentSocket);
-```
+- the relay assigns a stream id per public connection and frames its bytes onto
+  the shared control connection
+- the agent demultiplexes frames back into one connection per stream to the local
+  service
 
-Node streams handle **backpressure** for free: if one side is slower, reads on
-the other pause automatically until it drains — so a large response never piles
-up unbounded in memory.
+Frames are length-prefixed — `type(1) | streamId(4) | length(4) | payload` — which
+is how stream boundaries are recovered from TCP's boundary-less byte stream.
+Multiple requests share one connection concurrently (HTTP/2-style), so the agent
+no longer reconnects per request.
+
+Backpressure is handled at the **connection level**: if the shared control socket
+fills, the source sockets pause and resume together on drain. (Per-stream flow
+control — to avoid head-of-line blocking — is a later milestone.)
 
 ## Requirements
 
@@ -65,18 +70,18 @@ pnpm dev:agent --relay localhost:4443 --local localhost:3000
 ## Development
 
 ```bash
-pnpm test            # node:test integration suite
-pnpm typecheck   # tsc --noEmit
-pnpm build       # emit dist/
+pnpm test         # frame, session & integration/concurrency suites
+pnpm typecheck    # tsc --noEmit
+pnpm build        # emit dist/
 ```
 
 ## Layout
 
 ```
-src/relay/    relay server (burrowd) — public + control listeners, pairing
-src/agent/    local agent (burrow)   — outbound connection, local forwarding, reconnect
-src/shared/   byte-pipe primitive & address parsing shared by both
-tests/        cross-process integration test
+src/relay/    relay server (burrowd) — public + control listeners, stream demux
+src/agent/    local agent (burrow)   — persistent control connection, per-stream local forwarding
+src/shared/   frame codec, multiplexing session, address parsing, logger
+tests/        frame & session unit tests + integration / concurrency tests
 ```
 
 ## Logging
@@ -92,12 +97,9 @@ In an interactive terminal logs render human-readable via `pino-pretty`; when pi
 ## Roadmap
 
 - [x] **v0.1 — Single forwarding**: pair one public connection with one agent connection and pipe bytes as-is. One request per connection.
-- [ ] **v0.2 — Multiplexing**: carry multiple concurrent requests over a single control connection. Length-prefixed framing + stream IDs. Prerequisite for concurrent webhooks.
+- [x] **v0.2 — Multiplexing**: many concurrent streams over a single control connection. Length-prefixed framing + stream IDs. Concurrent requests no longer block each other.
 - [ ] **v0.3 — Resilience**: agent reconnect with exponential backoff, 502 when no agent is attached, timeouts, graceful shutdown.
 - [ ] **v0.4 — Authentication**: agent token auth. Mandatory the moment the public port faces the internet.
 - [ ] **v0.5 — TLS**: encrypt the control connection.
 - [ ] **v0.6 — Operations**: Dockerfile, structured logging, health check endpoint.
-
-## License
-
-MIT © Jonghyeok Park
+```
